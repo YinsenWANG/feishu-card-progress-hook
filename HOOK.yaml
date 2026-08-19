@@ -1,0 +1,11 @@
+# 自动进度卡片 Hook — 为飞书长任务自动管理交互卡片
+name: feishu-card-progress
+description: "自动为 3+ 步飞书任务创建/更新/完成交互卡片（agent:start/step/interim/end 事件驱动，旁白进卡片）"
+version: 3.0.0
+events:
+  - agent:start
+  - agent:step
+  - agent:interim
+  - agent:end
+platforms:
+  - feishu
