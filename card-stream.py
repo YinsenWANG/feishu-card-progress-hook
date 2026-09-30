@@ -4,12 +4,12 @@
   card-stream.py send <chat_id> <标题> [<内容>]        # 发卡片, 输出 message_id
   card-stream.py update <message_id> <标题> [<内容>]    # 流式更新（默认追加模式）
   card-stream.py replace <message_id> <标题> [<内容>]   # 替换模式（覆盖旧内容）
-  card-stream.py finish <message_id> <标题> <内容>      # 完成态（绿色 + 追加）
+  card-stream.py finish <message_id> <标题> <内容>      # 终态（覆盖，成功绿色；警告黄色）
 
 默认追加模式：新内容追加到卡片已有内容后面（保留历史），更适合过程展示。
 
-身份：所有 lark-cli 调用使用环境变量 LARK_CLI_PROFILE 指定的 profile；
-未设置时使用 lark-cli 全局默认配置。请确保调用环境已正确配置飞书应用凭据。
+身份：所有 lark-cli 调用显式固定 --profile cli_a93011294a39dbc6。
+状态使用活动 HERMES_HOME；失败不发送额外聊天消息。
 """
 import sys
 import json
@@ -18,37 +18,62 @@ import os
 import uuid
 import re
 
-CACHE = os.path.expanduser("~/.hermes/cache/card_stream_state.json")
+from pathlib import Path
+from functools import wraps
+import importlib.util
+_spec = importlib.util.spec_from_file_location("card_stream_storage", Path(__file__).with_name("storage.py"))
+_storage = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(_storage)
+
+PROFILE = "cli_a93011294a39dbc6"
 ELEMENT_ID = "md_1"
-# 2026-08-15 加固：缓存条目上限（防止无限增长），超出时保留最近 N 条
 MAX_CACHE_ENTRIES = 60
 
-def load_cache():
-    try:
-        with open(CACHE) as f:
-            return json.load(f)
-    except Exception:
-        return {}
 
-def save_cache(c):
-    os.makedirs(os.path.dirname(CACHE), exist_ok=True)
-    # 2026-08-15 加固：清理超限条目（dict 保持插入顺序，保留最近 MAX_CACHE_ENTRIES 条）
-    if len(c) > MAX_CACHE_ENTRIES:
-        # 旧条目在 dict 前面，删掉最旧的 (len - MAX) 条
-        excess = len(c) - MAX_CACHE_ENTRIES
-        for k in list(c.keys())[:excess]:
-            c.pop(k, None)
-    with open(CACHE, "w") as f:
-        json.dump(c, f, ensure_ascii=False, indent=1)
+def cache_path():
+    return _storage.home() / "cache" / "card_stream_state.json"
+
+
+def load_cache():
+    return _storage.load(cache_path())
+
+
+def save_cache(cache):
+    for key in list(cache)[:max(0, len(cache) - MAX_CACHE_ENTRIES)]:
+        cache.pop(key, None)
+    _storage.save(cache_path(), cache)
+
+
+def serialized(fn):
+    @wraps(fn)
+    def call(*args, **kwargs):
+        try:
+            with _storage.lock(cache_path()):
+                return fn(*args, **kwargs)
+        except (OSError, ValueError, TimeoutError):
+            print("card operation failed; state retained", file=sys.stderr)
+            return 1
+    return call
+
 
 def run_cmd(cmd):
-    r = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
-    raw = r.stdout
-    idx = raw.find("{")
+    # Every network boundary must use the explicit allowed profile, even new call sites.
+    if cmd[:3] != ["lark-cli", "--profile", PROFILE]:
+        raise ValueError("explicit card CLI profile required")
     try:
-        return json.loads(raw[idx:])
-    except Exception:
-        return {"ok": False, "error": {"message": raw[:200]}}
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=8)
+        raw = r.stdout
+        idx = raw.find("{")
+        data = json.loads(raw[idx:]) if idx >= 0 else {}
+        if r.returncode == 0 and isinstance(data, dict):
+            return data
+    except (OSError, subprocess.SubprocessError, ValueError):
+        pass
+    return {"ok": False}
+
+
+def succeeded(data):
+    return data.get("ok") is True or data.get("code") == 0
 
 def norm(content):
     """规范化内容：
@@ -90,13 +115,13 @@ def get_state(mid):
     cache = load_cache()
     st = cache.get(mid)
     if not st or not st.get("card_id"):
-        conv = run_cmd(["lark-cli", *(["--profile", os.environ["LARK_CLI_PROFILE"]] if os.environ.get("LARK_CLI_PROFILE") else []), "api", "POST", "/open-apis/cardkit/v1/cards/id_convert",
+        conv = run_cmd(["lark-cli", "--profile", PROFILE, "api", "POST", "/open-apis/cardkit/v1/cards/id_convert",
                         "--data", json.dumps({"message_id": mid}),
                         "--as", "bot", "--format", "json"])
         cid = ""
-        if conv.get("ok") or conv.get("code") == 0:
+        if succeeded(conv):
             cid = conv.get("data", {}).get("card_id", "") or ""
-        st = {"card_id": cid, "seq": 0, "content": ""}
+        st = {**(st or {}), "card_id": cid, "seq": (st or {}).get("seq", 0)}
         cache[mid] = st
         save_cache(cache)
     return st
@@ -108,7 +133,7 @@ def bump_seq(mid, st):
     save_cache(cache)
     return st["seq"]
 
-def cardkit_update(mid, content, append=True, header=None):
+def cardkit_update(mid, content, append=True, header=None, title=""):
     """CardKit 更新。成功 True，不可用/失败 None。"""
     st = get_state(mid)
     cid = st.get("card_id", "")
@@ -126,13 +151,13 @@ def cardkit_update(mid, content, append=True, header=None):
                 "params": {"element_id": ELEMENT_ID, "partial_element": {"content": content}}}]
     if header:
         actions.append({"action": "partial_update_setting",
-                        "params": {"settings": {"header": {"template": header}}}})
+                        "params": {"settings": {"header": {"template": header, "title": {"tag": "plain_text", "content": title}}}}})
     body = {"uuid": str(uuid.uuid4()), "sequence": seq,
             "actions": json.dumps(actions, ensure_ascii=False)}
-    d = run_cmd(["lark-cli", *(["--profile", os.environ["LARK_CLI_PROFILE"]] if os.environ.get("LARK_CLI_PROFILE") else []), "api", "POST", f"/open-apis/cardkit/v1/cards/{cid}/batch_update",
+    d = run_cmd(["lark-cli", "--profile", PROFILE, "api", "POST", f"/open-apis/cardkit/v1/cards/{cid}/batch_update",
                  "--data", json.dumps(body, ensure_ascii=False),
                  "--as", "bot", "--format", "json"])
-    if d.get("ok") or d.get("code") == 0:
+    if succeeded(d):
         cache = load_cache()
         cache[mid] = st
         save_cache(cache)
@@ -140,86 +165,62 @@ def cardkit_update(mid, content, append=True, header=None):
     return None
 
 def im_patch(mid, title, content, template="blue"):
-    """im PATCH 整卡更新，带 3 次重试 + 指数退避。成功 True，失败 False。"""
+    """Idempotent whole-card replacement. Handler owns bounded retries."""
     card = build_card(title, content, template)
-    content_json = json.dumps(card, ensure_ascii=False)
-    payload = json.dumps({"msg_type": "interactive", "content": content_json}, ensure_ascii=False)
-    import time as _time
-    for attempt in range(3):
-        d = run_cmd(["lark-cli", *(["--profile", os.environ["LARK_CLI_PROFILE"]] if os.environ.get("LARK_CLI_PROFILE") else []), "api", "PATCH", f"/open-apis/im/v1/messages/{mid}",
-                     "--data", payload, "--as", "bot", "--format", "json"])
-        if d.get("ok") or d.get("code") == 0:
-            return True
-        if attempt < 2:
-            _time.sleep(1.5 * (attempt + 1))  # 1.5s, 3s 退避
-    return False
+    payload = json.dumps({"msg_type": "interactive", "content": json.dumps(card, ensure_ascii=False)}, ensure_ascii=False)
+    return succeeded(run_cmd(["lark-cli", "--profile", PROFILE, "api", "PATCH",
+                              f"/open-apis/im/v1/messages/{mid}", "--data", payload,
+                              "--as", "bot", "--format", "json"]))
 
+
+@serialized
 def send(chat_id, title, content=""):
+    cache = load_cache()  # Reject corrupt/unreadable state before sending.
     card = build_card(title, content or "正在处理...", "blue")
     payload = json.dumps(card, ensure_ascii=False)
-    d = run_cmd(["lark-cli", *(["--profile", os.environ["LARK_CLI_PROFILE"]] if os.environ.get("LARK_CLI_PROFILE") else []), "im", "+messages-send", "--chat-id", chat_id,
+    d = run_cmd(["lark-cli", "--profile", PROFILE, "im", "+messages-send", "--chat-id", chat_id,
                  "--msg-type", "interactive", "--content", payload, "--as", "bot", "--format", "json"])
-    if not (d.get("ok") or d.get("code") == 0):
+    if not (succeeded(d)):
         print(json.dumps(d.get("error", d), ensure_ascii=False), file=sys.stderr)
         return 1
     mid = d.get("data", {}).get("message_id")
     if not mid:
         print("no message_id in response", file=sys.stderr)
         return 1
-    conv = run_cmd(["lark-cli", *(["--profile", os.environ["LARK_CLI_PROFILE"]] if os.environ.get("LARK_CLI_PROFILE") else []), "api", "POST", "/open-apis/cardkit/v1/cards/id_convert",
-                    "--data", json.dumps({"message_id": mid}),
-                    "--as", "bot", "--format", "json"])
+    # Persist the accepted message; CardKit ID is resolved only if PATCH fails.
     cid = ""
-    if conv.get("ok") or conv.get("code") == 0:
-        cid = conv.get("data", {}).get("card_id", "") or ""
-    cache = load_cache()
     cache[mid] = {"card_id": cid, "seq": 0, "content": norm(content or "正在处理..."), "chat_id": chat_id}
     save_cache(cache)
     print(mid)
     return 0
 
+def _replace(mid, title, content, template):
+    cache = load_cache()  # Validate state before the network boundary.
+    if im_patch(mid, title, content, template):
+        st = cache.setdefault(mid, {"card_id": "", "seq": 0})
+        st["content"] = norm(content)
+        save_cache(cache)
+        return 0
+    if cardkit_update(mid, norm(content), append=False, header=template, title=title) is True:
+        return 0
+    print("card replacement failed", file=sys.stderr)
+    return 1
+
+
+@serialized
 def update(mid, title, content="", append=True):
-    # 2026-08-13 定稿：原生 im PATCH 主推（简单可靠），CardKit 仅作回退
-    if im_patch(mid, title, content):
-        return 0
-    r = cardkit_update(mid, content, append=append)
-    if r is True:
-        return 0
-    # 终极兜底：卡片全挂时用 hermes send 发纯文本（零 LLM，保证用户看到进度）
-    st = get_state(mid)
-    chat_id = st.get("chat_id", "") if st else ""
-    if chat_id and fallback_text(chat_id, title, content):
-        print(f"update failed for {mid}, fell back to text", file=sys.stderr)
-        return 0
-    print(f"update failed for {mid}", file=sys.stderr)
-    return 1
+    if append:
+        previous = load_cache().get(mid, {}).get("content", "")
+        content = "\n".join(part for part in (previous, content) if part)
+    return _replace(mid, title, content, "blue")
 
+
+@serialized
 def finish(mid, title, content):
-    # 2026-08-13 定稿：原生 im PATCH 主推（简单可靠），CardKit 仅作回退
-    if im_patch(mid, title, content, "green"):
-        return 0
-    r = cardkit_update(mid, content, append=True, header="green")
-    if r is True:
-        return 0
-    # 终极兜底：卡片全挂时用 hermes send 发纯文本
-    st = get_state(mid)
-    chat_id = st.get("chat_id", "") if st else ""
-    if chat_id and fallback_text(chat_id, title, content):
-        print(f"finish failed for {mid}, fell back to text", file=sys.stderr)
-        return 0
-    print(f"finish failed for {mid}", file=sys.stderr)
-    return 1
+    # Unknown outcome and interrupted cards must never look like successful completion.
+    template = "green" if title.startswith("✅") else "yellow"
+    return _replace(mid, title, content, template)
 
-def fallback_text(chat_id, title, content):
-    """终极兜底：卡片全挂时用 hermes send 发纯文本（零 LLM，保证用户看到进度）"""
-    import subprocess as _sp
-    text = f"{title}\n{content}"
-    try:
-        r = _sp.run(["hermes", "send", "-t", f"feishu:{chat_id}", text],
-                    capture_output=True, text=True, timeout=30)
-        return r.returncode == 0
-    except Exception:
-        return False
 
 def build_progress_content(steps_done, steps_total, step_desc=""):
     """渲染步骤进度：✅ 已完成 / 🔄 当前 / ⬜ 待做 + 进度 emoji"""
