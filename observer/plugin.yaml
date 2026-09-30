@@ -1,0 +1,6 @@
+name: feishu-card-progress-observer
+version: "0.1.0"
+description: Native interim narration observer for the external gateway card hook
+provides_hooks:
+  - pre_llm_call
+  - on_interim_message
